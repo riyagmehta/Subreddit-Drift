@@ -222,7 +222,7 @@ Devvit.addCustomPostType({
         
         <text size="large" weight="bold">Which subreddit?</text>
         
-        <vstack gap="xsmall" padding="small" backgroundColor="neutral-background-weak" cornerRadius="small">
+        <vstack gap="small" padding="small" backgroundColor="neutral-background-weak" cornerRadius="small">
           {currentThread.comments.map((comment, idx) => (
             <vstack key={`c-${idx}`}>
               <hstack gap="small">
@@ -234,7 +234,7 @@ Devvit.addCustomPostType({
           ))}
         </vstack>
         
-        <vstack gap="xsmall">
+        <vstack gap="small">
           {currentThread.options.map((option, idx) => (
             <button
               key={`opt-${idx}`}
