@@ -1,0 +1,17 @@
+{
+  "name": "subreddit-drift",
+  "version": "1.0.0",
+  "description": "Daily game where players guess which subreddit a thread came from",
+  "main": "src/main.tsx",
+  "scripts": {
+    "dev": "devvit playtest",
+    "build": "devvit build",
+    "upload": "devvit upload"
+  },
+  "devDependencies": {
+    "@devvit/cli": "latest",
+    "@devvit/protos": "latest",
+    "@devvit/public-api": "latest",
+    "typescript": "^5.0.0"
+  }
+}
