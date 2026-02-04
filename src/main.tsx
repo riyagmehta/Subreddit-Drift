@@ -214,8 +214,9 @@ Devvit.addCustomPostType({
     
     return (
       <vstack height="100%" width="100%" gap="small" padding="medium">
-        <hstack alignment="space-between">
+        <hstack width="100%" alignment="center">
           <text weight="bold">Q{currentQuestion + 1}/5</text>
+          <spacer />
           <text weight="bold" color="orangered-500">Score: {score}</text>
         </hstack>
         
