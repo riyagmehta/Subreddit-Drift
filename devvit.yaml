@@ -1,15 +1,6 @@
-name: subreddit-drift
+name: subdrift-game
 version: 1.0.0
 description: Daily game where players guess which subreddit a thread came from
 
-runtime: web
-
-permissions:
-  - reddit.read
-  - redis
-
-app:
-  post:
-    - label: "Play Subreddit Drift"
-      description: "Guess the subreddit from comment threads"
-      onSubmit: createGamePost
+redditAPI: true
+redis: true
