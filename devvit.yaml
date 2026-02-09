@@ -1,6 +1,5 @@
-name: subdrift-game
+name: subdrift-game12
 version: 1.0.0
 description: Daily game where players guess which subreddit a thread came from
-
 redditAPI: true
 redis: true

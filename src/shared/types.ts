@@ -11,6 +11,7 @@ export interface Thread {
   correctSubreddit: string;
   difficulty: DifficultyLevel;
   subredditDisplay: string;
+  options: string[];
 }
 
 export type DifficultyLevel = 'easy' | 'medium' | 'hard' | 'expert';
@@ -24,8 +25,11 @@ export interface AnswerOption {
 export interface DailyChallenge {
   id: string;
   date: string;
-  threads: Thread[];
-  options: AnswerOption[][];
+  threads: Array<{
+    correctAnswer: string;
+    options: string[];
+    comments: Array<{ author: string; score: number; text: string }>;
+  }>;
   createdAt: number;
 }
 
@@ -46,6 +50,7 @@ export interface PlayerScore {
   date: string;
   streak: number;
   completedAt: number;
+  difficulty: DifficultyLevel;
 }
 
 export interface GameState {
@@ -54,6 +59,7 @@ export interface GameState {
   startTime: number;
   threadStartTime: number;
   isComplete: boolean;
+  selectedDifficulty: DifficultyLevel;
 }
 
 export interface LeaderboardEntry {
@@ -64,6 +70,15 @@ export interface LeaderboardEntry {
   correctCount: number;
   totalTime: number;
   streak: number;
+  difficulty: DifficultyLevel;
+}
+
+export interface StreakData {
+  userId: string;
+  currentStreak: number;
+  longestStreak: number;
+  lastPlayedDate: string;
+  totalDaysPlayed: number;
 }
 
 export const SCORING = {
@@ -72,6 +87,12 @@ export const SCORING = {
   MAX_TIME_BONUS: 500,
   STREAK_BONUS: 50,
   MAX_STREAK_BONUS: 500,
+  DIFFICULTY_MULTIPLIERS: {
+    easy: 1,
+    medium: 1.5,
+    hard: 2,
+    expert: 3,
+  },
 } as const;
 
 export const GAME_CONFIG = {
@@ -80,4 +101,6 @@ export const GAME_CONFIG = {
   TIME_LIMIT_SECONDS: 60,
   MIN_COMMENTS_PER_THREAD: 15,
   MAX_COMMENTS_DISPLAY: 20,
+  LEADERBOARD_SIZE: 10,
+  DIFFICULTY_LEVELS: ['easy', 'medium', 'hard', 'expert'] as const,
 } as const;
