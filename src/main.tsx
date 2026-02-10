@@ -5,426 +5,317 @@ Devvit.configure({
   redis: true,
 });
 
-const SUBREDDITS = [
+const SUBREDDIT_POOL = [
   'gaming', 'pcgaming', 'technology', 'programming',
-  'movies', 'science', 'fitness', 'cooking'
+  'movies', 'television', 'science', 'askscience',
+  'fitness', 'cooking', 'Art', 'DIY', 'Music', 'books'
 ];
 
-// Redis Keys
-const REDIS_KEYS = {
-  streak: (userId: string) => `streak:${userId}`,
-  score: (userId: string, date: string) => `score:${userId}:${date}`,
-  leaderboard: (date: string) => `leaderboard:${date}`,
-  userStats: (userId: string) => `stats:${userId}`,
-  dailyChallenge: (date: string) => `challenge:${date}`,
-};
-
-const getMockComments = (subreddit: string) => {
-  const comments: { [key: string]: string[] } = {
-    gaming: ['Just finished this game!', 'Amazing graphics', 'Worth the money!'],
-    pcgaming: ['Best performance settings?', 'Ultra settings look great', 'RTX works great'],
-    technology: ['Just got the new phone', 'Love the new updates', 'Tech is advancing fast'],
-    programming: ['This code is elegant', 'Clean implementation', 'Great algorithms'],
-    movies: ['Best movie ever!', 'Cinematography was amazing', 'Loved the ending'],
-    science: ['Fascinating research', 'Breakthrough discovery', 'Mind blowing'],
-    fitness: ['New PR today!', 'Feeling great', 'Great progress!'],
-    cooking: ['Delicious recipe', 'Turned out great', 'Highly recommend']
-  };
-  return comments[subreddit] || ['Great post!', 'Love this', 'Amazing'];
-};
-
-// Redis Backend Functions
-const getStreakData = async (redis: any, userId: string) => {
-  try {
-    const key = REDIS_KEYS.streak(userId);
-    const data = await redis.get(key);
-    if (data) {
-      return JSON.parse(data);
-    }
-    return {
-      userId,
-      currentStreak: 0,
-      longestStreak: 0,
-      lastPlayedDate: '',
-      totalGamesPlayed: 0,
-    };
-  } catch (e) {
-    console.error('Error getting streak:', e);
-    return { userId, currentStreak: 0, longestStreak: 0, lastPlayedDate: '', totalGamesPlayed: 0 };
-  }
-};
-
-const saveStreakData = async (redis: any, userId: string, streakData: any) => {
-  try {
-    const key = REDIS_KEYS.streak(userId);
-    await redis.set(key, JSON.stringify(streakData), { ex: 86400 * 365 });
-    return true;
-  } catch (e) {
-    console.error('Error saving streak:', e);
-    return false;
-  }
-};
-
-const saveScore = async (redis: any, userId: string, username: string, score: number, correctCount: number, date: string) => {
-  try {
-    // Save individual score
-    const scoreKey = REDIS_KEYS.score(userId, date);
-    const scoreData = {
-      userId,
-      username,
-      score,
-      correctCount,
-      timestamp: Date.now(),
-    };
-    await redis.set(scoreKey, JSON.stringify(scoreData), { ex: 86400 * 30 });
-
-    // Add to leaderboard (sorted set)
-    const leaderboardKey = REDIS_KEYS.leaderboard(date);
-    await redis.zAdd(leaderboardKey, {
-      score,
-      member: JSON.stringify({ userId, username, score, correctCount }),
-    });
-
-    // Trim to top 100
-    await redis.zRemRangeByRank(leaderboardKey, 0, -101);
-
-    // Update user stats
-    const statsKey = REDIS_KEYS.userStats(userId);
-    const statsData = await redis.get(statsKey);
-    let stats = statsData ? JSON.parse(statsData) : { userId, username, totalGames: 0, totalScore: 0, highScore: 0 };
-    
-    stats.totalGames = (stats.totalGames || 0) + 1;
-    stats.totalScore = (stats.totalScore || 0) + score;
-    stats.highScore = Math.max(stats.highScore || 0, score);
-    stats.lastPlayedDate = date;
-
-    await redis.set(statsKey, JSON.stringify(stats), { ex: 86400 * 365 });
-
-    return true;
-  } catch (e) {
-    console.error('Error saving score:', e);
-    return false;
-  }
-};
-
-const getLeaderboard = async (redis: any, date: string, limit = 10) => {
-  try {
-    const leaderboardKey = REDIS_KEYS.leaderboard(date);
-    const entries = await redis.zRange(leaderboardKey, { start: 0, stop: limit - 1, by: 'rank', reverse: true });
-    return entries.map((entry: string, idx: number) => ({
-      rank: idx + 1,
-      ...JSON.parse(entry),
-    }));
-  } catch (e) {
-    console.error('Error getting leaderboard:', e);
-    return [];
-  }
-};
-
-const getUserStats = async (redis: any, userId: string) => {
-  try {
-    const statsKey = REDIS_KEYS.userStats(userId);
-    const data = await redis.get(statsKey);
-    if (data) {
-      return JSON.parse(data);
-    }
-    return { userId, totalGames: 0, totalScore: 0, highScore: 0 };
-  } catch (e) {
-    console.error('Error getting user stats:', e);
-    return { userId, totalGames: 0, totalScore: 0, highScore: 0 };
-  }
-};
+const TIME_LIMIT = 60; // seconds
 
 Devvit.addCustomPostType({
-  name: 'Subreddit Drift Game',
-  description: 'Guess the subreddit from comments!',
+  name: 'Subreddit Drift',
   height: 'tall',
   render: (context) => {
-    const { useState, useInterval } = context as any;
+    const { useState, useInterval } = context;
     
-    const [gameState, setGameState] = useState('menu');
+    const [gameStarted, setGameStarted] = useState(false);
     const [currentQuestion, setCurrentQuestion] = useState(0);
     const [score, setScore] = useState(0);
-    const [answers, setAnswers] = useState([]);
-    const [timeLeft, setTimeLeft] = useState(60);
-    const [selectedAnswer, setSelectedAnswer] = useState(null);
-    const [showingResult, setShowingResult] = useState(false);
-    const [userStreak, setUserStreak] = useState(0);
-    const [questionOrder, setQuestionOrder] = useState([]);
-
-    // Initialize game with random questions
-    const initializeGame = async () => {
-      const shuffled = [...SUBREDDITS].sort(() => Math.random() - 0.5).slice(0, 5);
-      setQuestionOrder(shuffled);
-      setGameState('playing');
-      setCurrentQuestion(0);
-      setScore(0);
-      setAnswers([]);
-      setTimeLeft(60);
-      setSelectedAnswer(null);
-      setShowingResult(false);
-
-      const reddit = context.reddit;
-      const redis = context.redis;
-      try {
-        const user = await reddit.getCurrentUser();
-        if (user) {
-          // Get current streak from Redis
-          const streakData = await getStreakData(redis, user.id);
-          setUserStreak(streakData.currentStreak || 0);
-        }
-      } catch (e) {
-        console.error('Error loading user data:', e);
+    const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null);
+    const [isLoading, setIsLoading] = useState(false);
+    const [timeRemaining, setTimeRemaining] = useState(TIME_LIMIT);
+    const [questionStartTime, setQuestionStartTime] = useState(Date.now());
+    const [currentThread, setCurrentThread] = useState<{
+      correctAnswer: string;
+      options: string[];
+      comments: Array<{ author: string; score: number; text: string }>;
+    } | null>(null);
+    
+    // Timer countdown
+    const timerInterval = useInterval(() => {
+      if (!gameStarted || isLoading || selectedAnswer !== null || currentQuestion >= 5) {
+        return;
       }
-    };
-
-    // Timer - counts down every second during gameplay
-    useInterval(() => {
-      if (gameState === 'playing' && timeLeft > 0) {
-        setTimeLeft(timeLeft - 1);
-      }
-      if (timeLeft === 1 && gameState === 'playing') {
-        // Auto-submit if time runs out
-        if (!showingResult && selectedAnswer === null) {
-          // Time's up, show timeout feedback
-          setSelectedAnswer('TIMEOUT');
-          setShowingResult(true);
-          setAnswers([...answers, false]);
-        }
+      
+      const elapsed = Math.floor((Date.now() - questionStartTime) / 1000);
+      const remaining = Math.max(0, TIME_LIMIT - elapsed);
+      setTimeRemaining(remaining);
+      
+      // Auto-submit when time runs out
+      if (remaining === 0 && selectedAnswer === null && currentThread) {
+        handleAnswerSelect(currentThread.options[0], true); // Wrong answer
       }
     }, 1000);
-
-    const handleNextQuestion = async () => {
-      if (currentQuestion < 4) {
-        setCurrentQuestion(currentQuestion + 1);
-        setSelectedAnswer(null);
-        setShowingResult(false);
-        setTimeLeft(60);
-      } else {
-        // This is the last question, finish the game
-        await finishGame();
-      }
-    };
-
-    const handleAnswer = (selected: string) => {
-      if (showingResult) return;
-
-      const correctSub = questionOrder[currentQuestion];
-      const isCorrect = selected === correctSub;
-
-      setSelectedAnswer(selected);
-      setShowingResult(true);
-      setAnswers([...answers, isCorrect]);
-
-      if (isCorrect) {
-        setScore(score + 20);
-      }
-    };
-
-    const finishGame = async () => {
+    
+    timerInterval.start();
+    
+    const fetchRandomThread = async () => {
+      setIsLoading(true);
       const reddit = context.reddit;
-      const redis = context.redis;
-
+      
       try {
-        const user = await reddit.getCurrentUser();
-        if (user) {
-          const today = new Date().toISOString().split('T')[0];
-          
-          // Get current streak data
-          const streakData = await getStreakData(redis, user.id);
-          const previousDate = new Date(today);
-          previousDate.setDate(previousDate.getDate() - 1);
-          const previousDateStr = previousDate.toISOString().split('T')[0];
-
-          // Calculate new streak
-          let newStreak = 1;
-          if (streakData.lastPlayedDate === previousDateStr) {
-            newStreak = (streakData.currentStreak || 0) + 1;
-          }
-
-          // Update streak data
-          const updatedStreakData = {
-            userId: user.id,
-            currentStreak: newStreak,
-            longestStreak: Math.max(newStreak, streakData.longestStreak || 0),
-            lastPlayedDate: today,
-            totalGamesPlayed: (streakData.totalGamesPlayed || 0) + 1,
-          };
-
-          // Save to Redis
-          await saveStreakData(redis, user.id, updatedStreakData);
-          await saveScore(redis, user.id, user.username, score, answers.filter((a: any) => a).length, today);
-
-          setUserStreak(newStreak);
+        const randomSub = SUBREDDIT_POOL[Math.floor(Math.random() * SUBREDDIT_POOL.length)];
+        
+        const posts = await reddit.getTopPosts({
+          subredditName: randomSub,
+          timeframe: 'month',
+          limit: 50,
+        }).all();
+        
+        if (posts.length === 0) {
+          throw new Error('No posts found');
         }
-      } catch (e) {
-        console.error('Error finishing game:', e);
+        
+        const viablePosts = posts.filter(p => p.numberOfComments >= 10);
+        
+        if (viablePosts.length === 0) {
+          throw new Error('No posts with enough comments');
+        }
+        
+        let goodComments: Array<{ author: string; score: number; text: string }> = [];
+        let attempts = 0;
+        
+        while (goodComments.length < 2 && attempts < 3) {
+          const selectedPost = viablePosts[Math.floor(Math.random() * viablePosts.length)];
+          
+          const comments = await reddit.getComments({
+            postId: selectedPost.id,
+            limit: 30,
+            sort: 'top',
+          }).all();
+          
+          const filtered = comments
+            .filter(c => 
+              c.body && 
+              c.body.length > 15 && 
+              c.body.length < 400 &&
+              !c.body.toLowerCase().includes('[deleted]') &&
+              !c.body.toLowerCase().includes('[removed]') &&
+              !c.body.toLowerCase().includes('http') &&
+              c.score >= 1
+            )
+            .map(c => ({
+              author: c.authorName || 'anonymous',
+              score: c.score,
+              text: c.body.substring(0, 250)
+            }));
+          
+          goodComments = filtered.slice(0, 3);
+          attempts++;
+        }
+        
+        if (goodComments.length === 0) {
+          throw new Error('Could not find suitable comments');
+        }
+        
+        const wrongOptions = SUBREDDIT_POOL
+          .filter(sub => sub !== randomSub)
+          .sort(() => Math.random() - 0.5)
+          .slice(0, 3);
+        
+        const options = [randomSub, ...wrongOptions].sort(() => Math.random() - 0.5);
+        
+        setCurrentThread({
+          correctAnswer: randomSub,
+          options: options,
+          comments: goodComments
+        });
+        
+      } catch (error) {
+        console.error('Error fetching thread:', error);
+        
+        const mockQuestions = [
+          {
+            correctAnswer: 'gaming',
+            options: ['gaming', 'pcgaming', 'technology', 'movies'],
+            comments: [
+              { author: 'gamer123', score: 250, text: 'Just finished this game and wow, the ending was incredible!' },
+              { author: 'player456', score: 180, text: 'Anyone else think the graphics are a huge step up from the previous version?' },
+              { author: 'casual_fan', score: 95, text: 'Been playing for hours, totally worth the purchase!' },
+            ]
+          },
+          {
+            correctAnswer: 'technology',
+            options: ['technology', 'programming', 'science', 'pcgaming'],
+            comments: [
+              { author: 'tech_enthusiast', score: 340, text: 'The new processor architecture is a game changer for mobile devices.' },
+              { author: 'early_adopter', score: 220, text: 'Finally upgraded and the performance difference is night and day.' },
+              { author: 'skeptical_user', score: 150, text: 'Battery life could be better but overall solid improvements.' },
+            ]
+          },
+          {
+            correctAnswer: 'movies',
+            options: ['movies', 'television', 'Music', 'Art'],
+            comments: [
+              { author: 'film_buff', score: 420, text: 'The cinematography in this film is absolutely breathtaking.' },
+              { author: 'critic_wannabe', score: 280, text: 'Best plot twist I have seen in years. Totally unexpected!' },
+              { author: 'weekend_viewer', score: 165, text: 'Went in with low expectations but came out amazed.' },
+            ]
+          },
+        ];
+        
+        const fallback = mockQuestions[currentQuestion % mockQuestions.length];
+        setCurrentThread(fallback);
       }
-
-      setGameState('result');
+      
+      setIsLoading(false);
+      setQuestionStartTime(Date.now());
+      setTimeRemaining(TIME_LIMIT);
     };
-
-    const resetGame = () => {
-      setGameState('menu');
+    
+    const handleStartGame = async () => {
+      setGameStarted(true);
+      await fetchRandomThread();
+    };
+    
+    const handleAnswerSelect = (answer: string, timeOut: boolean = false) => {
+      if (selectedAnswer !== null) return;
+      
+      const timeTaken = Math.floor((Date.now() - questionStartTime) / 1000);
+      setSelectedAnswer(answer);
+      
+      if (currentThread && answer === currentThread.correctAnswer && !timeOut) {
+        // Base score + time bonus
+        const baseScore = 100;
+        const timeBonus = Math.max(0, (TIME_LIMIT - timeTaken) * 2); // 2 points per second saved
+        const totalPoints = baseScore + timeBonus;
+        setScore(score + totalPoints);
+      }
+    };
+    
+    const handleNextQuestion = async () => {
+      setCurrentQuestion(currentQuestion + 1);
       setSelectedAnswer(null);
-      setShowingResult(false);
+      await fetchRandomThread();
     };
-
-    // MENU SCREEN
-    if (gameState === 'menu') {
+    
+    const handlePlayAgain = () => {
+      setGameStarted(false);
+      setCurrentQuestion(0);
+      setScore(0);
+      setSelectedAnswer(null);
+      setCurrentThread(null);
+      setTimeRemaining(TIME_LIMIT);
+    };
+    
+    if (!gameStarted) {
       return (
-        <vstack height="100%" width="100%" alignment="center middle" gap="large" padding="large" backgroundColor="neutral-background-strong">
-          <text size="xxlarge" weight="bold" color="orangered-500">🎮 Subreddit Drift</text>
-          <text size="large" alignment="center">Guess the subreddit from the comments!</text>
-          
-          {userStreak > 0 && (
-            <vstack padding="medium" backgroundColor="neutral-background-weak" cornerRadius="medium" alignment="center" width="100%">
-              <text size="large" weight="bold" color="orangered-500">🔥 {userStreak} Day Streak!</text>
-            </vstack>
-          )}
-
-          <spacer />
-          <button onPress={initializeGame} size="large">
-            Start Game
-          </button>
+        <vstack height="100%" width="100%" alignment="center middle" gap="medium" padding="large">
+          <text size="xxlarge" weight="bold" color="orangered-500">Subreddit Drift</text>
+          <text size="large">Daily Reddit Culture Quiz</text>
+          <spacer size="small" />
+          <text alignment="center">Identify subreddits from real comment threads</text>
+          <text size="small" color="neutral-content-weak">5 questions - 60 seconds each</text>
+          <spacer size="medium" />
+          <button onPress={handleStartGame} appearance="primary" size="large">Start Game</button>
         </vstack>
       );
     }
-
-    // RESULT SCREEN
-    if (gameState === 'result') {
-      const correctCount = answers.filter(a => a).length;
-      const emoji = answers.map(a => a ? '🟩' : '🟥').join('');
-
+    
+    if (isLoading || !currentThread) {
       return (
-        <vstack height="100%" width="100%" alignment="center middle" gap="medium" padding="large" backgroundColor="neutral-background-strong">
-          <text size="xxlarge" weight="bold">🎉 Game Over!</text>
-          <text size="xlarge" weight="bold" color="orangered-500">Score: {score}</text>
-          <text size="large">{correctCount}/5 Correct</text>
-          <text size="large">🔥 Streak: {userStreak}</text>
-          <text size="medium" color="neutral-content">{emoji}</text>
-
-          {correctCount === 5 && <text size="large" color="green-500">Perfect Score! 🌟</text>}
-          {correctCount >= 3 && correctCount < 5 && <text size="large">Great job! 💪</text>}
-          {correctCount < 3 && <text size="large">Better luck tomorrow! 📚</text>}
-
-          <text size="small" color="neutral-content-weak">Score saved to leaderboard ✓</text>
-
-          <spacer />
-          <button onPress={resetGame} size="large">
-            Back to Menu
-          </button>
+        <vstack height="100%" width="100%" alignment="center middle" gap="medium">
+          <text size="large">Loading thread from Reddit...</text>
+          <text size="small" color="neutral-content-weak">Question {currentQuestion + 1}/5</text>
         </vstack>
       );
     }
-
-    // PLAYING SCREEN
-    if (gameState === 'playing' && questionOrder.length > 0) {
-      const correctSub = questionOrder[currentQuestion];
-      const comments = getMockComments(correctSub);
-
-      // Create 4 options with correct answer and 3 random wrong ones
-      const options = [correctSub];
-      while (options.length < 4) {
-        const random = SUBREDDITS[Math.floor(Math.random() * SUBREDDITS.length)];
-        if (!options.includes(random)) {
-          options.push(random);
-        }
-      }
-      options.sort(() => Math.random() - 0.5);
-
+    
+    if (currentQuestion >= 5) {
       return (
-        <vstack height="100%" width="100%" padding="small" gap="small" backgroundColor="neutral-background-strong">
-          {/* Header - compact */}
-          <hstack width="100%" alignment="center">
-            <text size="medium" weight="bold">Q{currentQuestion + 1}/5</text>
-            <spacer />
-            <text size="medium" weight="bold" color="orangered-500">Score: {score}</text>
-            <spacer />
-            <text size="medium" weight="bold" color={timeLeft < 10 ? 'red-500' : 'neutral-content'}>⏱ {timeLeft}s</text>
-          </hstack>
-
-          {/* Progress bar */}
-          <hstack width="100%" height="4px" backgroundColor="neutral-background-weak" cornerRadius="small">
-            <vstack width={`${(currentQuestion / 5) * 100}%`} height="100%" backgroundColor="orangered-500" cornerRadius="small" />
-          </hstack>
-
-          {/* Comments section - compact */}
-          <vstack gap="small" padding="small" backgroundColor="neutral-background-weak" cornerRadius="medium">
-            <text weight="bold" size="small" color="orangered-500">r/{correctSub}:</text>
-            {comments.slice(0, 2).map((comment) => (
-              <text size="small" color="neutral-content">• {comment}</text>
-            ))}
-          </vstack>
-
-          {/* Question */}
-          <text size="medium" weight="bold" alignment="center">Which subreddit?</text>
-
-          {/* Options - buttons that show feedback */}
-          <vstack gap="small" width="100%">
-            {options.map((option) => {
-              const isCorrect = option === correctSub;
-              const isSelected = selectedAnswer === option;
-              
-              let bgColor = 'neutral-background-weak';
-              let textColor = 'neutral-content';
-
-              if (showingResult) {
-                if (isCorrect) {
-                  bgColor = 'green-500';
-                  textColor = 'white';
-                } else if (isSelected) {
-                  bgColor = 'red-500';
-                  textColor = 'white';
-                }
-              }
-
-              return (
-                <button 
-                  key={option}
-                  onPress={() => handleAnswer(option)}
-                  disabled={showingResult}
-                  appearance="secondary"
-                >
-                  r/{option} {isCorrect && showingResult ? ' ✓' : ''} {isSelected && !isCorrect && showingResult ? ' ✗' : ''}
-                </button>
-              );
-            })}
-          </vstack>
-
-          {/* FEEDBACK SECTION - Show immediately after answer */}
-          {showingResult ? (
-            <vstack gap="medium" padding="small" backgroundColor="neutral-background-weak" cornerRadius="medium" alignment="center" width="100%">
-              {selectedAnswer === 'TIMEOUT' ? (
-                <vstack gap="small" alignment="center">
-                  <text weight="bold" size="large" color="red-500">⏰ Time's Up!</text>
-                  <text size="small" color="neutral-content">Right: r/{correctSub}</text>
-                </vstack>
-              ) : selectedAnswer === correctSub ? (
-                <text weight="bold" size="large" color="green-500">✅ Correct!</text>
-              ) : (
-                <vstack gap="small" alignment="center">
-                  <text weight="bold" size="large" color="red-500">❌ Wrong!</text>
-                  <text size="small" color="neutral-content">Right: r/{correctSub}</text>
-                </vstack>
-              )}
-              <button onPress={handleNextQuestion} appearance="primary">
-                {currentQuestion === 4 ? 'See Results' : 'Next →'}
-              </button>
-            </vstack>
-          ) : (
-            <vstack gap="small" padding="small" backgroundColor="neutral-background-weak" cornerRadius="medium" alignment="center" width="100%">
-              <text size="small" color="neutral-content-weak">↑ Select answer</text>
-            </vstack>
-          )}
+        <vstack height="100%" width="100%" alignment="center middle" gap="medium" padding="large">
+          <text size="xxlarge" weight="bold">Game Complete!</text>
+          <text size="xlarge" color="orangered-500">Score: {score}</text>
+          <text size="medium">You got {Math.floor(score / 100)} out of 5 correct!</text>
+          <spacer size="small" />
+          <text size="small" color="neutral-content-weak">
+            Includes time bonuses: +{score % 500} points
+          </text>
+          <spacer size="medium" />
+          <button onPress={handlePlayAgain} appearance="primary" size="large">Play Again</button>
         </vstack>
       );
     }
-
-    // Loading
+    
+    const isAnswered = selectedAnswer !== null;
+    const isCorrect = selectedAnswer === currentThread.correctAnswer;
+    const timerPercent = (timeRemaining / TIME_LIMIT) * 100;
+    const timerColor = timeRemaining > 20 ? 'green-500' : timeRemaining > 10 ? 'yellow-500' : 'red-500';
+    
     return (
-      <vstack height="100%" width="100%" alignment="center middle" backgroundColor="neutral-background-strong">
-        <text size="large" weight="bold">Loading...</text>
+      <vstack height="100%" width="100%" gap="small" padding="medium">
+        <hstack alignment="center" gap="medium">
+          <text weight="bold">Q{currentQuestion + 1}/5</text>
+          <spacer size="medium" />
+          <text weight="bold" color="orangered-500">Score: {score}</text>
+        </hstack>
+        
+        {/* Timer Bar */}
+        <vstack gap="small">
+          <hstack alignment="center" gap="medium">
+            <text size="small" weight="bold">Time Remaining</text>
+            <spacer size="medium" />
+            <text size="small" weight="bold" color={timerColor}>{timeRemaining}s</text>
+          </hstack>
+          <hstack width="100%" height="8px" backgroundColor="neutral-background-weak" cornerRadius="full">
+            <hstack 
+              width={`${timerPercent}%`} 
+              height="8px" 
+              backgroundColor={timerColor}
+              cornerRadius="full"
+            />
+          </hstack>
+        </vstack>
+        
+        <text size="large" weight="bold">Which subreddit?</text>
+        
+        <vstack gap="small" padding="small" backgroundColor="neutral-background-weak" cornerRadius="small">
+          {currentThread.comments.map((comment, idx) => (
+            <vstack key={`c-${idx}`}>
+              <hstack gap="small">
+                <text size="small" color="neutral-content-weak">u/{comment.author}</text>
+                <text size="small" color="neutral-content-weak">↑{comment.score}</text>
+              </hstack>
+              <text size="medium">{comment.text}</text>
+            </vstack>
+          ))}
+        </vstack>
+        
+        <vstack gap="small">
+          {currentThread.options.map((option, idx) => (
+            <button
+              key={`opt-${idx}`}
+              onPress={() => handleAnswerSelect(option)}
+              appearance={
+                isAnswered
+                  ? option === currentThread.correctAnswer ? 'success'
+                  : option === selectedAnswer ? 'destructive' : 'secondary'
+                  : 'secondary'
+              }
+              disabled={isAnswered}
+              size="medium"
+            >
+              r/{option}
+            </button>
+          ))}
+        </vstack>
+        
+        {isAnswered && (
+          <vstack alignment="center middle" gap="small">
+            <text weight="bold">
+              {isCorrect ? 'Correct!' : `Wrong! r/${currentThread.correctAnswer}`}
+            </text>
+            {isCorrect && (
+              <text size="small" color="neutral-content-weak">
+                +{100 + Math.max(0, (TIME_LIMIT - Math.floor((Date.now() - questionStartTime) / 1000)) * 2)} points
+              </text>
+            )}
+            <button onPress={handleNextQuestion} appearance="primary" size="medium">
+              {currentQuestion < 4 ? 'Next Question' : 'See Results'}
+            </button>
+          </vstack>
+        )}
       </vstack>
     );
   },
@@ -437,16 +328,15 @@ Devvit.addMenuItem({
     const { reddit, ui } = context;
     const subreddit = await reddit.getCurrentSubreddit();
     const post = await reddit.submitPost({
-      title: '🎮 Subreddit Drift - Daily Quiz!',
+      title: 'Daily Subreddit Drift - Test Your Reddit Knowledge!',
       subredditName: subreddit.name,
       preview: (
-        <vstack height="100%" width="100%" alignment="center middle" gap="medium" padding="large" backgroundColor="neutral-background">
-          <text size="xxlarge" weight="bold" color="orangered-500">🎮 Subreddit Drift</text>
-          <text size="large">Guess the subreddit!</text>
+        <vstack height="100%" width="100%" alignment="center middle">
+          <text size="xlarge" weight="bold">Subreddit Drift</text>
         </vstack>
       ),
     });
-    ui.showToast('🎮 Post created!');
+    ui.showToast('Post created!');
     ui.navigateTo(post);
   },
 });

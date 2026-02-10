@@ -1,5 +1,5 @@
 {
-  "name": "subdrift-game12",
+  "name": "subdrift-game123",
   "version": "0.0.0",
   "description": "Daily game where players guess which subreddit a thread came from",
   "main": "src/main.tsx",
@@ -9,9 +9,9 @@
     "upload": "devvit upload"
   },
   "devDependencies": {
-    "@devvit/cli": "0.12.11",
-    "@devvit/protos": "0.12.11",
-    "@devvit/public-api": "0.12.11",
+    "@devvit/cli": "0.12.12",
+    "@devvit/protos": "0.12.12",
+    "@devvit/public-api": "0.12.12",
     "typescript": "^5.0.0"
   },
   "type": "module",
