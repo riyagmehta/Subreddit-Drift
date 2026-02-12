@@ -88,15 +88,17 @@ const FALLBACK_THREADS = [
   },
 ];
 
-type Comment = { author: string; score: number; text: string };
-type Thread = { correctAnswer: string; options: string[]; comments: Comment[]; difficulty: string };
-type PlayerScore = { username: string; score: number; correct: number; date: string; streak: number };
+// Helper to get today's date string
+function getTodayKey(): string {
+  const today = new Date();
+  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+}
 
 Devvit.addCustomPostType({
   name: 'Subreddit Drift',
   height: 'tall',
   render: (context) => {
-    const { useState, useInterval, redis, reddit } = context;
+    const { useState, useInterval, redis, postId } = context;
 
     const [screen, setScreen] = useState<'start' | 'loading' | 'playing' | 'results' | 'leaderboard'>('start');
     const [currentQuestion, setCurrentQuestion] = useState(0);
@@ -105,13 +107,53 @@ Devvit.addCustomPostType({
     const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null);
     const [timeRemaining, setTimeRemaining] = useState(TIME_LIMIT);
     const [questionStartTime, setQuestionStartTime] = useState(Date.now());
-    const [threads, setThreads] = useState<Thread[]>([]);
+    const [threads] = useState(FALLBACK_THREADS);
     const [answers, setAnswers] = useState<{ correct: boolean; time: number }[]>([]);
-    const [leaderboard, setLeaderboard] = useState<PlayerScore[]>([]);
-    const [alreadyPlayed, setAlreadyPlayed] = useState(false);
-    const [streak, setStreak] = useState(0);
-    const [loadingMessage, setLoadingMessage] = useState('Loading...');
+    const [streak, setStreak] = useState(1);
     const [questionScores, setQuestionScores] = useState<number[]>([]);
+    const [leaderboardData, setLeaderboardData] = useState<Array<{username: string; score: number; correct: number; streak: number}>>([]);
+    const [playedToday, setPlayedToday] = useState(false);
+    const [username, setUsername] = useState<string>('');
+
+    // Load data when screen changes
+    const loadLeaderboard = async () => {
+      try {
+        const entries = await redis.zRange(`leaderboard:${postId}`, 0, 9, { reverse: true, by: 'score' });
+        const data = await Promise.all(
+          entries.map(async (entry) => {
+            const playerData = await redis.hGetAll(`player:${postId}:${entry.member}`);
+            return {
+              username: entry.member,
+              score: entry.score,
+              correct: parseInt(playerData.correct || '0'),
+              streak: parseInt(playerData.streak || '1'),
+            };
+          })
+        );
+        setLeaderboardData(data);
+      } catch (e) {
+        console.error('Error loading leaderboard:', e);
+      }
+    };
+
+    const checkIfPlayedToday = async () => {
+      try {
+        const currentUser = await context.reddit.getCurrentUser();
+        if (!currentUser) return;
+        
+        setUsername(currentUser.username);
+        const todayKey = getTodayKey();
+        const lastPlayed = await redis.get(`lastPlayed:${postId}:${currentUser.username}`);
+        const userStreak = await redis.get(`streak:${postId}:${currentUser.username}`);
+        
+        setPlayedToday(lastPlayed === todayKey);
+        if (userStreak) {
+          setStreak(parseInt(userStreak));
+        }
+      } catch (e) {
+        console.error('Error checking play status:', e);
+      }
+    };
 
     const timerInterval = useInterval(() => {
       if (screen !== 'playing' || selectedAnswer !== null) return;
@@ -122,186 +164,15 @@ Devvit.addCustomPostType({
     }, 1000);
     timerInterval.start();
 
-    const getTodayDate = () => new Date().toISOString().split('T')[0];
-
-    const checkAlreadyPlayed = async (): Promise<boolean> => {
-      try {
-        const user = await reddit.getCurrentUser();
-        if (!user) return false;
-        const val = await redis.get(`played:${user.id}:${getTodayDate()}`);
-        return val === 'true';
-      } catch (e) { return false; }
-    };
-
-    const markAsPlayed = async () => {
-      try {
-        const user = await reddit.getCurrentUser();
-        if (!user) return;
-        await redis.set(`played:${user.id}:${getTodayDate()}`, 'true');
-        await redis.expire(`played:${user.id}:${getTodayDate()}`, 86400 * 2);
-      } catch (e) { console.error(e); }
-    };
-
-    const getStreak = async (): Promise<number> => {
-      try {
-        const user = await reddit.getCurrentUser();
-        if (!user) return 0;
-        const val = await redis.get(`streak:${user.id}`);
-        return parseInt(val || '0');
-      } catch (e) { return 0; }
-    };
-
-    const saveScore = async (finalScore: number, correct: number): Promise<number> => {
-      try {
-        const user = await reddit.getCurrentUser();
-        if (!user) return 0;
-        const today = getTodayDate();
-
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yStr = yesterday.toISOString().split('T')[0];
-        const playedY = await redis.get(`played:${user.id}:${yStr}`);
-        const curStreak = parseInt(await redis.get(`streak:${user.id}`) || '0');
-        const newStreak = playedY === 'true' ? curStreak + 1 : 1;
-
-        await redis.set(`streak:${user.id}`, newStreak.toString());
-        await redis.expire(`streak:${user.id}`, 86400 * 30);
-        await redis.zAdd(`leaderboard:${today}`, { member: user.username, score: finalScore });
-        await redis.expire(`leaderboard:${today}`, 86400 * 7);
-        await redis.set(
-          `score:${user.username}:${today}`,
-          JSON.stringify({ username: user.username, score: finalScore, correct, date: today, streak: newStreak })
-        );
-        await redis.expire(`score:${user.username}:${today}`, 86400 * 7);
-
-        return newStreak;
-      } catch (e) {
-        console.error('saveScore error:', e);
-        return 0;
-      }
-    };
-
-    const loadLeaderboard = async () => {
-      try {
-        const today = getTodayDate();
-        const topEntries = await redis.zRange(`leaderboard:${today}`, 0, 9, { reverse: true, by: 'rank' });
-        const scores: PlayerScore[] = [];
-        for (const entry of topEntries) {
-          const data = await redis.get(`score:${entry}:${today}`);
-          if (data) scores.push(JSON.parse(data));
-        }
-        setLeaderboard(scores);
-      } catch (e) { setLeaderboard([]); }
-    };
-
-    const getDailyChallenge = async (): Promise<Thread[]> => {
-      const today = getTodayDate();
-      try {
-        const cached = await redis.get(`challenge:${today}`);
-        if (cached) return JSON.parse(cached);
-      } catch (e) { console.error('Cache check failed:', e); }
-      fetchAndCacheChallenge(today).catch(e => console.error('Background fetch failed:', e));
-      return FALLBACK_THREADS;
-    };
-
-    const fetchAndCacheChallenge = async (date: string) => {
-      try {
-        const newThreads = await generateChallenge();
-        await redis.set(`challenge:${date}`, JSON.stringify(newThreads));
-        await redis.expire(`challenge:${date}`, 86400);
-      } catch (e) { console.error('Failed to cache challenge:', e); }
-    };
-
-    const generateChallenge = async (): Promise<Thread[]> => {
-      const difficulties = ['easy', 'easy', 'medium', 'hard', 'hard'];
-      const result: Thread[] = [];
-      const usedSubs: string[] = [];
-      for (let i = 0; i < 5; i++) {
-        const thread = await fetchThreadForDifficulty(difficulties[i], usedSubs);
-        result.push(thread);
-        usedSubs.push(thread.correctAnswer);
-      }
-      return result;
-    };
-
-    const fetchThreadForDifficulty = async (difficulty: string, usedSubs: string[]): Promise<Thread> => {
-      try {
-        const groups = DIFFICULTY_GROUPS[difficulty as keyof typeof DIFFICULTY_GROUPS];
-        const availableGroups = groups.filter(g => !g.some(s => usedSubs.includes(s)));
-        const group = availableGroups.length > 0
-          ? availableGroups[Math.floor(Math.random() * availableGroups.length)]
-          : groups[Math.floor(Math.random() * groups.length)];
-
-        const correctSub = group[Math.floor(Math.random() * group.length)];
-        const wrongOptions = group.filter(s => s !== correctSub);
-
-        const posts = await reddit.getTopPosts({
-          subredditName: correctSub,
-          timeframe: 'month',
-          limit: 25,
-        }).all();
-
-        const viablePosts = posts.filter(p => p.numberOfComments >= 10);
-        if (viablePosts.length === 0) throw new Error('No viable posts');
-
-        const post = viablePosts[Math.floor(Math.random() * viablePosts.length)];
-        const comments = await reddit.getComments({
-          postId: post.id,
-          limit: 20,
-          sort: 'top',
-        }).all();
-
-        const goodComments = comments
-          .filter(c =>
-            c.body &&
-            c.body.length > 15 &&
-            c.body.length < 300 &&
-            !c.body.toLowerCase().includes('[deleted]') &&
-            !c.body.toLowerCase().includes('[removed]') &&
-            !c.body.toLowerCase().includes('http') &&
-            c.score >= 1
-          )
-          .slice(0, 3)
-          .map(c => ({ author: c.authorName || 'anon', score: c.score, text: c.body.substring(0, 250) }));
-
-        if (goodComments.length === 0) throw new Error('No good comments');
-
-        return {
-          correctAnswer: correctSub,
-          options: [correctSub, ...wrongOptions.slice(0, 3)].sort(() => Math.random() - 0.5),
-          comments: goodComments,
-          difficulty
-        };
-      } catch (e) {
-        const fallback = FALLBACK_THREADS[Math.floor(Math.random() * FALLBACK_THREADS.length)];
-        return { ...fallback, difficulty };
-      }
-    };
-
     const handleStartGame = async () => {
-      setLoadingMessage("Loading today's challenge...");
-      setScreen('loading');
-      try {
-        const played = await checkAlreadyPlayed();
-        if (played) {
-          setAlreadyPlayed(true);
-          await loadLeaderboard();
-          const existingStreak = await getStreak();
-          setStreak(existingStreak);
-          setScreen('leaderboard');
-          return;
-        }
-        const dailyThreads = await getDailyChallenge();
-        setThreads(dailyThreads);
-        setQuestionStartTime(Date.now());
-        setTimeRemaining(TIME_LIMIT);
-        setScreen('playing');
-      } catch (e) {
-        setThreads(FALLBACK_THREADS);
-        setQuestionStartTime(Date.now());
-        setTimeRemaining(TIME_LIMIT);
-        setScreen('playing');
+      if (playedToday) {
+        context.ui.showToast("You've already played today! Come back tomorrow for a new challenge.");
+        return;
       }
+      
+      setScreen('playing');
+      setQuestionStartTime(Date.now());
+      setTimeRemaining(TIME_LIMIT);
     };
 
     const handleAnswerSelect = (answer: string) => {
@@ -323,7 +194,8 @@ Devvit.addCustomPostType({
     const handleNextQuestion = () => {
       const next = currentQuestion + 1;
       if (next >= 5) {
-        handleGameComplete();
+        saveScore();
+        setScreen('results');
       } else {
         setCurrentQuestion(next);
         setSelectedAnswer(null);
@@ -332,80 +204,186 @@ Devvit.addCustomPostType({
       }
     };
 
-    const handleGameComplete = async () => {
-      setLoadingMessage('Saving your score...');
-      setScreen('loading');
-      try {
-        await markAsPlayed();
-        const newStreak = await saveScore(score, correctCount);
-        setStreak(newStreak);
-        await loadLeaderboard();
-      } catch (e) {
-        console.error('Save failed:', e);
+    const saveScore = async () => {
+      if (!username) return;
+
+      const todayKey = getTodayKey();
+      const avgTime = answers.length > 0
+        ? Math.floor(answers.reduce((s, a) => s + a.time, 0) / answers.length)
+        : 0;
+
+      // Update streak
+      const lastPlayed = await redis.get(`lastPlayed:${postId}:${username}`);
+      let newStreak = 1;
+      if (lastPlayed) {
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayKey = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+        if (lastPlayed === yesterdayKey) {
+          const currentStreak = await redis.get(`streak:${postId}:${username}`);
+          newStreak = parseInt(currentStreak || '1') + 1;
+        }
       }
-      setScreen('results');
+
+      // Save to Redis
+      await redis.zAdd(`leaderboard:${postId}`, { member: username, score });
+      await redis.hSet(`player:${postId}:${username}`, {
+        correct: correctCount.toString(),
+        streak: newStreak.toString(),
+        avgTime: avgTime.toString(),
+      });
+      await redis.set(`lastPlayed:${postId}:${username}`, todayKey);
+      await redis.set(`streak:${postId}:${username}`, newStreak.toString());
+      
+      setStreak(newStreak);
+      setPlayedToday(true);
     };
 
-    const handleShowLeaderboard = async () => {
-      setLoadingMessage('Loading leaderboard...');
-      setScreen('loading');
-      await loadLeaderboard();
+    const handleViewLeaderboard = async () => {
       setScreen('leaderboard');
+      await loadLeaderboard();
     };
 
+    // START SCREEN
     if (screen === 'start') {
+      // Load user data when on start screen
+      if (!username) {
+        checkIfPlayedToday();
+      }
+      
       return (
         <vstack height="100%" width="100%" alignment="center middle" gap="medium" padding="large">
-          <text size="xxlarge" weight="bold" color="orangered-500">Subreddit Drift</text>
-          <text size="large">Daily Reddit Culture Quiz</text>
+          <text size="xxlarge" weight="bold" color="orangered-500">🎯 Subreddit Drift</text>
+          <text size="large" weight="bold">Daily Reddit Culture Quiz</text>
           <spacer size="small" />
-          <text alignment="center">Identify subreddits from real comment threads</text>
-          <text size="small" color="neutral-content-weak">5 questions - 60 seconds each</text>
+          <text alignment="center" color="neutral-content">Identify subreddits from real comment threads</text>
+          <text size="small" color="neutral-content-weak">5 questions • 60 seconds each</text>
+          
+          {playedToday && (
+            <vstack padding="medium" backgroundColor="yellow-100" cornerRadius="medium" gap="small">
+              <text size="medium" weight="bold" alignment="center">✅ Completed Today!</text>
+              <text size="small" alignment="center">Come back tomorrow for a new challenge</text>
+            </vstack>
+          )}
+          
+          {streak > 1 && (
+            <hstack gap="small" alignment="center middle">
+              <text size="large">🔥</text>
+              <text size="medium" weight="bold" color="orangered-500">{streak} Day Streak!</text>
+            </hstack>
+          )}
+          
           <spacer size="medium" />
-          <button onPress={handleStartGame} appearance="primary" size="large">Play Today's Challenge</button>
-          <button onPress={handleShowLeaderboard} appearance="secondary" size="medium">View Leaderboard</button>
+          <vstack gap="small" width="100%">
+            <button 
+              onPress={handleStartGame} 
+              appearance="primary" 
+              size="large"
+              disabled={playedToday}
+            >
+              {playedToday ? 'Already Played Today' : '🎮 Play Today\'s Challenge'}
+            </button>
+            <button onPress={handleViewLeaderboard} appearance="secondary" size="medium">
+              🏆 View Leaderboard
+            </button>
+          </vstack>
+          
+          <spacer size="small" />
+          <vstack gap="small" alignment="center">
+            <text size="small" color="neutral-content-weak">Scoring:</text>
+            <text size="small" color="neutral-content-weak">• 100 points + time bonus per correct answer</text>
+            <text size="small" color="neutral-content-weak">• Faster answers = higher scores!</text>
+          </vstack>
         </vstack>
       );
     }
 
-    if (screen === 'loading') {
+    // LEADERBOARD SCREEN
+    if (screen === 'leaderboard') {
       return (
-        <vstack height="100%" width="100%" alignment="center middle" gap="medium">
-          <text size="large">{loadingMessage}</text>
-          <text size="small" color="neutral-content-weak">Please wait...</text>
+        <vstack height="100%" width="100%" gap="medium" padding="medium">
+          <hstack alignment="space-between">
+            <text size="xlarge" weight="bold">🏆 Leaderboard</text>
+            <button onPress={() => setScreen('start')} appearance="secondary" size="small">
+              Back
+            </button>
+          </hstack>
+          
+          {leaderboardData && leaderboardData.length > 0 ? (
+            <vstack gap="small">
+              {leaderboardData.map((entry, idx) => (
+                <hstack
+                  key={`lb-${idx}`}
+                  padding="medium"
+                  backgroundColor={idx < 3 ? 'yellow-100' : 'neutral-background-weak'}
+                  cornerRadius="medium"
+                  alignment="middle"
+                  gap="medium"
+                >
+                  <text size="large" weight="bold" width="30px">
+                    {idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`}
+                  </text>
+                  <vstack grow gap="none">
+                    <text weight="bold">u/{entry.username}</text>
+                    <hstack gap="medium">
+                      <text size="small" color="neutral-content-weak">
+                        {entry.correct}/5 correct
+                      </text>
+                      {entry.streak > 1 && (
+                        <text size="small" color="orangered-500">
+                          🔥 {entry.streak} streak
+                        </text>
+                      )}
+                    </hstack>
+                  </vstack>
+                  <vstack alignment="end">
+                    <text size="large" weight="bold" color="orangered-500">
+                      {entry.score}
+                    </text>
+                    <text size="small" color="neutral-content-weak">points</text>
+                  </vstack>
+                </hstack>
+              ))}
+            </vstack>
+          ) : (
+            <vstack alignment="center middle" grow gap="small">
+              <text size="large">🎮</text>
+              <text>No scores yet!</text>
+              <text size="small" color="neutral-content-weak">Be the first to play</text>
+            </vstack>
+          )}
         </vstack>
       );
     }
 
+    // RESULTS SCREEN
     if (screen === 'results') {
       const diffMap: Record<string, string> = { easy: 'E', medium: 'M', hard: 'H' };
-      const shareEmojis = answers.map(a => a.correct ? 'X' : 'O').join(' ');
+      const shareEmojis = answers.map(a => a.correct ? '✅' : '❌').join(' ');
       const avgTime = answers.length > 0
         ? Math.floor(answers.reduce((s, a) => s + a.time, 0) / answers.length)
         : 0;
 
       return (
-        <vstack height="100%" width="100%" gap="small" padding="medium">
-          <text size="xlarge" weight="bold" alignment="center">Game Complete!</text>
-          <hstack alignment="center middle" gap="large">
+        <vstack height="100%" width="100%" gap="small" padding="small">
+          <text size="large" weight="bold" alignment="center">🎉 Complete!</text>
+          
+          <hstack alignment="center middle" gap="medium">
             <vstack alignment="center middle">
-              <text size="xxlarge" weight="bold" color="orangered-500">{score}</text>
+              <text size="xlarge" weight="bold" color="orangered-500">{score}</text>
               <text size="small" color="neutral-content-weak">Score</text>
             </vstack>
             <vstack alignment="center middle">
-              <text size="xxlarge" weight="bold">{correctCount}/5</text>
+              <text size="xlarge" weight="bold">{correctCount}/5</text>
               <text size="small" color="neutral-content-weak">Correct</text>
             </vstack>
             <vstack alignment="center middle">
-              <text size="xxlarge" weight="bold">{avgTime}s</text>
-              <text size="small" color="neutral-content-weak">Avg Time</text>
-            </vstack>
-            <vstack alignment="center middle">
-              <text size="xxlarge" weight="bold" color="orangered-500">{streak}</text>
-              <text size="small" color="neutral-content-weak">Day Streak</text>
+              <text size="large" weight="bold">🔥{streak}</text>
+              <text size="small" color="neutral-content-weak">Streak</text>
             </vstack>
           </hstack>
-          <vstack gap="small">
+          
+          <vstack gap="none">
             {threads.map((thread, idx) => (
               <hstack
                 key={`res-${idx}`}
@@ -413,87 +391,38 @@ Devvit.addCustomPostType({
                 backgroundColor="neutral-background-weak"
                 cornerRadius="small"
                 alignment="middle"
+                gap="small"
               >
-                <text size="small" width="20px">{idx + 1}.</text>
+                <text size="small">{answers[idx]?.correct ? '✅' : '❌'}</text>
                 <text size="small" grow color={answers[idx]?.correct ? 'green-600' : 'red-600'}>
                   r/{thread.correctAnswer}
                 </text>
                 <text size="small" color="neutral-content-weak">
-                  {answers[idx]?.correct ? `+${questionScores[idx]}` : '0 pts'}
+                  {answers[idx]?.correct ? `+${questionScores[idx]}` : '0'}
                 </text>
-                <text size="small" color="neutral-content-weak"> {diffMap[thread.difficulty]}</text>
               </hstack>
             ))}
           </vstack>
-          <vstack backgroundColor="neutral-background-weak" padding="small" cornerRadius="small" width="100%">
-            <text size="small" alignment="center">Subreddit Drift {getTodayDate()}</text>
-            <text size="medium" alignment="center" weight="bold">{shareEmojis} {correctCount}/5</text>
-            <text size="small" alignment="center">
-              Score: {score}{streak > 0 ? ` | ${streak} day streak` : ''}
-            </text>
+          
+          <vstack backgroundColor="neutral-background-weak" padding="small" cornerRadius="small" gap="none">
+            <text size="small" alignment="center">Subreddit Drift 🎯</text>
+            <text size="medium" alignment="center" weight="bold">{shareEmojis}</text>
+            <text size="small" alignment="center">{correctCount}/5 • {score} pts</text>
           </vstack>
-          <button onPress={handleShowLeaderboard} appearance="primary" size="medium">View Leaderboard</button>
-          <text size="small" color="neutral-content-weak" alignment="center">
-            Come back tomorrow for a new challenge!
-          </text>
+          
+          <hstack gap="small">
+            <button onPress={handleViewLeaderboard} appearance="secondary" size="small" grow>
+              🏆 Board
+            </button>
+            <button onPress={() => setScreen('start')} appearance="primary" size="small" grow>
+              Home
+            </button>
+          </hstack>
         </vstack>
       );
     }
 
-    if (screen === 'leaderboard') {
-      return (
-        <vstack height="100%" width="100%" gap="small" padding="medium">
-          <text size="xlarge" weight="bold" alignment="center">Leaderboard</text>
-          <text size="small" color="neutral-content-weak" alignment="center">Today's top players</text>
-          {streak > 0 && (
-            <hstack alignment="center middle" padding="small" backgroundColor="orangered-100" cornerRadius="small">
-              <text size="small" weight="bold" color="orangered-500">
-                Your streak: {streak} day{streak > 1 ? 's' : ''}
-              </text>
-            </hstack>
-          )}
-          <spacer size="small" />
-          {leaderboard.length === 0 ? (
-            <vstack alignment="center middle" grow>
-              <text>No scores yet today!</text>
-              <text size="small" color="neutral-content-weak">Be the first to play</text>
-            </vstack>
-          ) : (
-            <vstack gap="small">
-              {leaderboard.map((entry, idx) => (
-                <hstack
-                  key={`lb-${idx}`}
-                  padding="small"
-                  backgroundColor={idx === 0 ? 'orangered-100' : 'neutral-background-weak'}
-                  cornerRadius="small"
-                  alignment="middle"
-                >
-                  <text width="35px" weight="bold" size="small">
-                    {idx === 0 ? '1st' : idx === 1 ? '2nd' : idx === 2 ? '3rd' : `${idx + 1}th`}
-                  </text>
-                  <text grow size="small">u/{entry.username}</text>
-                  <text size="small" color="neutral-content-weak">{entry.correct}/5 </text>
-                  <text weight="bold" color="orangered-500">{entry.score}</text>
-                  {entry.streak > 1 && (
-                    <text size="small" color="orangered-400"> {entry.streak}d</text>
-                  )}
-                </hstack>
-              ))}
-            </vstack>
-          )}
-          <spacer size="small" />
-          {alreadyPlayed ? (
-            <text size="small" color="neutral-content-weak" alignment="center">
-              Come back tomorrow for a new challenge!
-            </text>
-          ) : (
-            <button onPress={handleStartGame} appearance="primary" size="medium">Play Now</button>
-          )}
-          <button onPress={() => setScreen('start')} appearance="secondary" size="small">Back</button>
-        </vstack>
-      );
-    }
-
+    // PLAYING SCREEN
     const thread = threads[currentQuestion];
     if (!thread) {
       return (
@@ -512,20 +441,21 @@ Devvit.addCustomPostType({
     };
 
     return (
-      <vstack height="100%" width="100%" gap="small" padding="medium">
-        <hstack alignment="space-between">
+      <vstack height="100%" width="100%" gap="none" padding="small">
+        <hstack alignment="space-between" padding="small">
           <hstack gap="small" alignment="middle">
-            <text weight="bold">Q{currentQuestion + 1}/5</text>
+            <text weight="bold" size="small">Q{currentQuestion + 1}/5</text>
             <text size="small" color={difficultyColors[thread.difficulty] || 'neutral-content-weak'}>
               {thread.difficulty.toUpperCase()}
             </text>
           </hstack>
-          <text weight="bold" color="orangered-500">Score: {score}</text>
+          <text weight="bold" color="orangered-500" size="small">💯 {score}</text>
         </hstack>
-        <vstack gap="small">
+        
+        <vstack gap="none" padding="small">
           <hstack alignment="space-between">
-            <text size="small">Time</text>
-            <text size="small" weight="bold" color={timerColor}>{timeRemaining}s</text>
+            <text size="small">⏱️ {timeRemaining}s</text>
+            <text size="small" weight="bold">Which subreddit?</text>
           </hstack>
           <hstack width="100%" height="6px" backgroundColor="neutral-background-weak" cornerRadius="full">
             <hstack
@@ -536,19 +466,20 @@ Devvit.addCustomPostType({
             />
           </hstack>
         </vstack>
-        <text size="large" weight="bold">Which subreddit?</text>
-        <vstack gap="small" padding="small" backgroundColor="neutral-background-weak" cornerRadius="small">
+        
+        <vstack gap="none" padding="small" backgroundColor="neutral-background-weak" cornerRadius="small">
           {thread.comments.map((comment, idx) => (
-            <vstack key={`c-${idx}`}>
+            <vstack key={`c-${idx}`} gap="none" padding="small">
               <hstack gap="small">
                 <text size="small" color="neutral-content-weak">u/{comment.author}</text>
-                <text size="small" color="neutral-content-weak">↑{comment.score}</text>
+                <text size="small" color="orangered-500">↑{comment.score}</text>
               </hstack>
-              <text size="medium">{comment.text}</text>
+              <text size="small">{comment.text}</text>
             </vstack>
           ))}
         </vstack>
-        <vstack gap="small">
+        
+        <vstack gap="none" padding="small">
           {thread.options.map((option, idx) => (
             <button
               key={`opt-${idx}`}
@@ -561,21 +492,22 @@ Devvit.addCustomPostType({
                   : 'secondary'
               }
               disabled={isAnswered}
-              size="medium"
+              size="small"
             >
               r/{option}
             </button>
           ))}
         </vstack>
+        
         {isAnswered && (
-          <vstack alignment="center middle" gap="small">
-            <text weight="bold">
+          <vstack alignment="center middle" gap="none" padding="small">
+            <text weight="bold" size="small">
               {isCorrect
-                ? `Correct! +${questionScores[questionScores.length - 1]} pts`
-                : `Wrong! It was r/${thread.correctAnswer}`}
+                ? `🎉 +${questionScores[questionScores.length - 1]} pts`
+                : `❌ r/${thread.correctAnswer}`}
             </text>
-            <button onPress={handleNextQuestion} appearance="primary" size="medium">
-              {currentQuestion < 4 ? 'Next Question' : 'See Results'}
+            <button onPress={handleNextQuestion} appearance="primary" size="small">
+              {currentQuestion < 4 ? 'Next →' : 'Results'}
             </button>
           </vstack>
         )}
@@ -591,15 +523,17 @@ Devvit.addMenuItem({
     const { reddit, ui } = context;
     const subreddit = await reddit.getCurrentSubreddit();
     const post = await reddit.submitPost({
-      title: 'Daily Subreddit Drift - Test Your Reddit Knowledge!',
+      title: '🎯 Daily Subreddit Drift - Test Your Reddit Knowledge!',
       subredditName: subreddit.name,
       preview: (
-        <vstack height="100%" width="100%" alignment="center middle">
-          <text size="xlarge" weight="bold">Subreddit Drift</text>
+        <vstack height="100%" width="100%" alignment="center middle" gap="medium" padding="large">
+          <text size="xxlarge" weight="bold" color="orangered-500">🎯 Subreddit Drift</text>
+          <text size="large">Daily Reddit Culture Quiz</text>
+          <text size="small" color="neutral-content-weak">Tap to play!</text>
         </vstack>
       ),
     });
-    ui.showToast('Post created!');
+    ui.showToast('🎮 Post created successfully!');
     ui.navigateTo(post);
   },
 });
